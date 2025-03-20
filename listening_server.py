@@ -12,7 +12,9 @@ import base64
 from bs4 import BeautifulSoup, NavigableString
 from smartcard.System import readers
 from smartcard.util import toHexString
-from smartcard.Exceptions import NoCardException, SmartcardException
+import serial
+import serial.tools.list_ports
+from adafruit_pn532.uart import PN532_UART
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -29,7 +31,7 @@ class YuGiOhCard:
         self.lang = lang
         self.number = number
         self.rarity = rarity
-        self.edition = edition
+        self.edition = edition  # New field for edition
 
         # Validate and encode the card during initialization
         self.encoded_data = self.encode_card()
@@ -205,262 +207,345 @@ class CinematicLogoPrinter:
 
 
 class NFCReader:
+    """A class to read NFC tags using either PN532 or pyscard interfaces."""
+
     TAG_PATTERN = "YG"
     OTHER_APP_PORT = 41112
     OTHER_APP_HOST = 'localhost'
     GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
 
-    def __init__(self, db_path: str, host: str = None, port: int = None):
+    def __init__(self, db_path: str, host: str = None, port: int = None, debug: bool = False):
+        """Initialize NFCReader with database path and optional connection settings."""
         self.db_path = db_path
-        self.base_db_path = self.get_base_db_path(db_path)
-        self.current_tag_uid = None
+        self.base_db_path = self._get_base_db_path(db_path)
         self.running = False
-        self.thread = None
-        self.reader = None
-        self.no_reader_logged = False
-        self.connection_error_logged = False
-
-        # Use provided values or default to class attributes
+        self.threads = []
+        self.debug = debug
         self.host = host or self.OTHER_APP_HOST
         self.port = port or self.OTHER_APP_PORT
 
-    def get_base_db_path(self, db_path):
-        """Return the base directory path of the database."""
+        # Reader state
+        self.reader = None
+        self.pn532 = None
+        self.uart = None
+
+        # Locks and state tracking
+        self.uid_lock = threading.Lock()
+        self.current_tag_uid = None
+        self.active_interface = None
+        self.interface_status = {"pn532": False, "pyscard": False}
+
+        # Logging state flags
+        self.no_reader_logged = False
+        self.connection_error_logged = False
+        self.scanning_for_pn532_printed = False
+        self.no_pn532_msg_printed = False
+        self.pn532_sleep = 0.5
+
+    @staticmethod
+    def _get_base_db_path(db_path):
+        """Get the base directory of the database path."""
         return os.path.dirname(os.path.abspath(db_path))
 
-    def process_tag_data(self, data):
-        try:
-            data = data[:-2]
-            decoded_card = YuGiOhCard.decode_card(data.decode("utf-8"))
-        except ValueError:
-            logger.info("Error: ValueError on Decode.")
+    def start(self):
+        """Start the NFC reader threads if not already running."""
+        if self.running:
+            logger.info("Listener already running.")
             return
+
+        self.running = True
+        self._start_listener_threads()
+
+        logger.info("Started both NFC Listening Threads.")
+        logger.info(f"Loaded DB Path: {self.db_path}")
+        logger.info(f"Transmitting Card Data on {self.host}:{self.port}")
+
+    def stop(self):
+        """Stop all NFC reader threads."""
+        self.running = False
+        for thread in self.threads:
+            thread.join()
+        logger.info("Stopped all NFC listening threads.")
+
+    def _start_listener_threads(self):
+        """Start the PN532 and pyscard listener threads."""
+        pn532_thread = threading.Thread(target=self._listen_pn532, daemon=True)
+        self.threads.append(pn532_thread)
+        pn532_thread.start()
+
+        pyscard_thread = threading.Thread(target=self._listen_pyscard, daemon=True)
+        self.threads.append(pyscard_thread)
+        pyscard_thread.start()
+
+    def _init_pn532(self):
+        """Initialize the PN532 NFC reader if available."""
+        # Print scanning message only once per scan cycle
+        if not self.scanning_for_pn532_printed:
+            print("Scanning for PN532...")
+            self.scanning_for_pn532_printed = True
+
+        for port in serial.tools.list_ports.comports():
+            try:
+                print(f"Trying {port.device} for PN532...")
+                uart = serial.Serial(port.device, baudrate=115200, timeout=1)
+                pn532 = PN532_UART(uart, debug=self.debug)
+
+                firmware = pn532.firmware_version
+                if firmware:
+                    print(f"PN532 detected on {port.device} (Firmware: {firmware[1]}.{firmware[2]})")
+                    self.uart = uart
+                    self.pn532 = pn532
+                    self.pn532.SAM_configuration()
+                    print("PN532 initialized. Waiting for an NFC card...")
+
+                    # Reset flags for next time
+                    self.scanning_for_pn532_printed = False
+                    self.no_pn532_msg_printed = False
+                    return True
+            except Exception:
+                continue
+
+        # No device found
+        if not self.no_pn532_msg_printed:
+            print(f"No PN532 detected. Retrying in 1 second...")
+            self.no_pn532_msg_printed = True
+        time.sleep(self.pn532_sleep)
+        return False
+
+    def _check_reader_connection(self):
+        """Check for available pyscard readers."""
+        available_readers = readers()
+        if available_readers:
+            self.reader = available_readers[0]
+            logger.info(f"pyscard: New NFC reader connected: {self.reader}")
+            self.no_reader_logged = False
+            self.connection_error_logged = False
+            return True
+        else:
+            if not self.no_reader_logged:
+                logger.info("pyscard: No NFC reader detected. Waiting for device...")
+                self.no_reader_logged = True
+            time.sleep(self.pn532_sleep)
+            return False
+
+    def _listen_pn532(self):
+        """Thread function to listen for NFC tags using PN532."""
+        while self.running:
+            # Initialize or reinitialize PN532 if needed
+            if self.pn532 is None:
+                if not self._init_pn532():
+                    continue
+
+            # Read tag if available
+            try:
+                uid = self.pn532.read_passive_target(timeout=0.5)
+            except Exception as e:
+                logger.error(f"PN532 read error: {e}")
+                logger.info("PN532 disconnected. Attempting reinitialization...")
+                self.pn532 = None
+                time.sleep(self.pn532_sleep)
+                continue
+
+            # Handle tag data
+            with self.uid_lock:
+                if uid is not None:
+                    self.interface_status["pn532"] = True
+                    if self.current_tag_uid is None:
+                        self.current_tag_uid = uid
+                        self.active_interface = "pn532"
+                        logger.info(f"PN532 detected card. UID: {[hex(x) for x in uid]}")
+                        full_data = self._read_ntag213_pages()
+                        self._process_tag_data(full_data)
+                else:
+                    self.interface_status["pn532"] = False
+
+            self._check_card_removal()
+            time.sleep(0.1)
+
+    def _listen_pyscard(self):
+        """Thread function to listen for NFC tags using pyscard."""
+        while self.running:
+            # Check for reader connection
+            if self.reader is None:
+                self._check_reader_connection()
+                continue
+
+            # Try to read UID from card
+            try:
+                connection = self.reader.createConnection()
+                connection.connect()
+                response, sw1, sw2 = connection.transmit(self.GET_UID)
+                success = (sw1 == 0x90 and sw2 == 0x00)
+            except Exception:
+                response = None
+                success = False
+
+            # Handle card data
+            with self.uid_lock:
+                if response is not None and success:
+                    uid = toHexString(response)
+                    self.interface_status["pyscard"] = True
+                    if self.current_tag_uid is None:
+                        self.current_tag_uid = uid
+                        self.active_interface = "pyscard"
+                        logger.info(f"pyscard detected card. UID: {uid}")
+                        tag_page = self._read_page(connection, 4)
+                        if tag_page:
+                            full_data = self._read_full_tag_data(connection)
+                            self._process_tag_data(bytes(full_data))
+                else:
+                    self.interface_status["pyscard"] = False
+
+            self._check_card_removal()
+            time.sleep(0.1)
+
+    def _read_ntag213_pages(self, start_page=4, end_page=14):
+        """Read multiple pages from NTAG213 using PN532."""
+        # logger.info(f"PN532: Reading NTAG213 memory pages from {start_page} to {end_page}:")
+        pages = []
+
+        for page in range(start_page, end_page + 1):
+            try:
+                data = self.pn532.ntag2xx_read_block(page)
+                if data:
+                    pages.append(data)
+            except Exception as e:
+                logger.error(f"PN532: Error reading page {page}: {e}")
+
+        raw_data = b"".join(pages)
+
+        try:
+            decoded_string = raw_data.decode("utf-8", errors="ignore")
+            logger.info(f"PN532: Decoded String: {decoded_string.strip()}")
+        except Exception as e:
+            logger.error(f"PN532: Error decoding raw data: {e}")
+
+        return raw_data
+
+    def _read_page(self, connection, page):
+        """Read a single page from NFC tag using pyscard."""
+        read_command = [0xFF, 0xB0, 0x00, page, 0x04]
+        response, sw1, sw2 = connection.transmit(read_command)
+
+        if sw1 == 0x90 and sw2 == 0x00:
+            return response
+
+        logger.error(f"pyscard: Read failed on page {page}. SW1: {sw1}, SW2: {sw2}")
+        return None
+
+    def _read_full_tag_data(self, connection):
+        """Read all relevant pages from NFC tag using pyscard."""
+        full_data = []
+        for page in range(4, 15):
+            page_data = self._read_page(connection, page)
+            if page_data:
+                full_data.extend(page_data)
+        return full_data
+
+    def _check_card_removal(self):
+        """Check if card has been removed from both interfaces."""
+        with self.uid_lock:
+            if self.current_tag_uid is not None:
+                if not (self.interface_status["pn532"] or self.interface_status["pyscard"]):
+                    logger.info(f"Card removed! UID: {self.current_tag_uid}")
+                    self._send_to_other_app(b'{"status":"CardRemoved"}')
+                    self.current_tag_uid = None
+                    self.active_interface = None
+
+    def _process_tag_data(self, data):
+        """Process the data read from an NFC tag."""
+        logger.info(f"Processing tag data: {data[:-2]}")
+
+        try:
+            trimmed = data[:-2]
+            decoded_card = YuGiOhCard.decode_card(trimmed.decode("utf-8"))
+        except ValueError:
+            logger.error("Error: ValueError on Decode.")
+            return
+
         read_passcode = str(decoded_card.get("passcode"))
         db_reader = SQLiteReader(self.db_path)
         result = db_reader.fetch_card_data(read_passcode)
 
-        if result:
-            card_data_json, image_path = result
+        if not result:
+            print("Card not found.")
+            return
 
-            # Create base64 image from the path.
-            full_path = os.path.join(self.base_db_path, image_path)
+        card_data_json, image_path = result
+        card_image = self._load_card_image(image_path)
+        card_metadata = self._extract_card_metadata(decoded_card)
 
-            # If the file doesn't exist, use "blank.png" instead
-            if not os.path.exists(full_path):
-                if getattr(sys, 'frozen', False):  # Checks if running as a PyInstaller executable
-                    base_path = sys._MEIPASS
-                else:
-                    base_path = os.getcwd()  # Normal execution, use current directory
-                full_path = os.path.join(base_path, "unknowncardart.png")
+        final_dict = {
+            "status": "NewCard",
+            "card_data": card_data_json,
+            "passcode": read_passcode,
+            "edition": card_metadata["edition_str"],
+            "set_string": card_metadata["set_str"],
+            "card_image": card_image
+        }
 
-            with open(full_path, "rb") as f:
-                image_bytes = f.read()
-                encoded_image = base64.b64encode(image_bytes).decode('utf-8')
+        data_final = json.dumps(final_dict).encode("utf-8")
+        self._send_to_other_app(data_final)
+        self._print_ascii_box(read_passcode, trimmed.decode("utf-8"), read_passcode)
 
-            # Construct card set string
-            set_id = decoded_card.get("set_id", "")
-            lang = decoded_card.get("lang", "")
-            number = str(decoded_card.get("number", ""))
-            set_str = f"{set_id}-{lang}{number}"
+    def _load_card_image(self, image_path):
+        """Load and encode card image from file."""
+        full_path = os.path.join(self.base_db_path, image_path)
 
-            # Handle Edition Parsing
-            edition = decoded_card.get("edition", "")
-            edition_str = ""
-            if edition:
-                with open(os.path.join(self.base_db_path, "edition.json"), "r") as edition_json_file:
-                    edition_json = json.load(edition_json_file)
-                matched_key = next((key for key, value in edition_json.items() if value == edition), None)
-                if matched_key:
-                    edition_str = matched_key
+        # Fall back to default image if not found
+        if not os.path.exists(full_path):
+            if getattr(sys, 'frozen', False):
+                base_path = sys._MEIPASS
+            else:
+                base_path = os.getcwd()
+            full_path = os.path.join(base_path, "unknowncardart.png")
 
-            final_dict = {
-                "status": "NewCard",
-                "card_data": card_data_json,
-                "passcode": read_passcode,
-                "edition": edition_str,
-                "set_string": set_str,
-                "card_image": encoded_image
-            }
+        with open(full_path, "rb") as f:
+            image_bytes = f.read()
+            return base64.b64encode(image_bytes).decode('utf-8')
 
-            data_final = json.dumps(final_dict)
-            data_final = data_final.encode("utf-8")
-            self.send_to_other_app(data_final)
+    def _extract_card_metadata(self, decoded_card):
+        """Extract metadata from decoded card data."""
+        # Set string
+        set_id = decoded_card.get("set_id", "")
+        lang = decoded_card.get("lang", "")
+        number = str(decoded_card.get("number", ""))
+        set_str = f"{set_id}-{lang}{number}"
 
-            # Now print the card info inside an ASCII box
-            self.print_ascii_box(read_passcode, data.decode("utf-8"), read_passcode)
+        # Edition string
+        edition = decoded_card.get("edition", "")
+        edition_str = ""
+        if edition:
+            edition_json_path = os.path.join(self.base_db_path, "edition.json")
+            with open(edition_json_path, "r") as edition_json_file:
+                edition_json = json.load(edition_json_file)
+            matched_key = next((key for key, value in edition_json.items()
+                                if value == edition), None)
+            if matched_key:
+                edition_str = matched_key
 
-        else:
-            logger.error("Card not found.")
-            return None
+        return {
+            "set_str": set_str,
+            "edition_str": edition_str
+        }
 
-    def print_ascii_box(self, uid, raw_data, card_name):
-        """Print the NFC Tag details in an ASCII box."""
+    def _print_ascii_box(self, uid, raw_data, card_name):
+        """Print information about the card in an ASCII box."""
         border = '+' + '-' * 60 + '+'
         print(border)
         print(f" Raw Data: {raw_data} ")
         print(f" Card ID: {card_name} ")
         print(border)
 
-    def get_base64_image(self, image_path):
-        """Get base64 encoded image from the file path."""
-        full_path = os.path.join(self.base_db_path, image_path)
-
-        if not os.path.exists(full_path):
-            full_path = self.get_default_image_path()
-
-        with open(full_path, "rb") as f:
-            image_bytes = f.read()
-            return base64.b64encode(image_bytes).decode('utf-8')
-
-    def get_default_image_path(self):
-        """Return default image path (for missing card images)."""
-        if getattr(sys, 'frozen', False):  # Running as a PyInstaller executable
-            return os.path.join(sys._MEIPASS, "unknowncardart.png")
-        return os.path.join(os.getcwd(), "unknowncardart.png")
-
-    def construct_set_string(self, decoded_card):
-        """Construct the set string from card data."""
-        set_id = decoded_card.get("set_id", "")
-        lang = decoded_card.get("lang", "")
-        number = str(decoded_card.get("number", ""))
-        return f"{set_id}-{lang}{number}"
-
-    def get_edition_string(self, decoded_card):
-        """Get the edition string from card data."""
-        edition = decoded_card.get("edition", "")
-        if edition:
-            edition_json = self.load_json_file("edition.json")
-            matched_key = next((key for key, value in edition_json.items() if value == edition), None)
-            return matched_key if matched_key else ""
-        return ""
-
-    def load_json_file(self, filename):
-        """Load a JSON file from the base DB path."""
-        with open(os.path.join(self.base_db_path, filename), "r") as file:
-            return json.load(file)
-
-    def send_to_other_app(self, data):
+    def _send_to_other_app(self, data):
         """Send data to another application via socket."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect((self.OTHER_APP_HOST, self.OTHER_APP_PORT))
+                s.connect((self.host, self.port))
                 s.sendall(data)
                 logger.info("Sent data to Card Viewer App.")
         except Exception as e:
-            logger.error("Error sending data:", e)
-
-    def read_page(self, connection, page):
-        """Read a specific page of data from the NFC tag."""
-        read_command = [0xFF, 0xB0, 0x00, page, 0x04]
-        response, sw1, sw2 = connection.transmit(read_command)
-        if sw1 == 0x90 and sw2 == 0x00:
-            return response
-        print(f"Read failed on page {page}. SW1: {sw1}, SW2: {sw2}")
-        return None
-
-    def listen(self):
-        """Listen for NFC tag connections and process data."""
-        while self.running:
-            # Check and attempt to reconnect if the reader is missing
-            while self.reader is None:
-                self.check_reader_connection()
-                time.sleep(2)  # Wait before retrying to avoid spamming
-
-            try:
-                connection = self.reader.createConnection()
-                connection.connect()
-            except NoCardException:
-                self.handle_no_card_exception()
-                continue
-            except Exception as e:
-                self.handle_connection_error(e)
-                self.reader = None  # Reset reader to trigger reconnection loop
-                continue
-
-            # Process the NFC tag once a connection is successful
-            self.process_nfc_tag(connection)
-
-    def check_reader_connection(self):
-        """Check and connect to an available NFC reader."""
-        available_readers = readers()
-        if available_readers:
-            self.reader = available_readers[0]
-            logger.info(f"New NFC reader connected: {self.reader}")
-            self.no_reader_logged = False
-            self.connection_error_logged = False
-        else:
-            if not self.no_reader_logged:
-                logger.info("No NFC reader detected. Waiting for device...")
-                self.no_reader_logged = True
-            time.sleep(1)
-
-    def handle_no_card_exception(self):
-        """Handle no card exception and log tag removal."""
-        if self.current_tag_uid is not None:
-            print(f"Tag removed. Last detected UID: {self.current_tag_uid}")
-            self.send_to_other_app(b'{"status":"CardRemoved"}')
-            self.current_tag_uid = None
-        time.sleep(1)
-
-    def handle_connection_error(self, error):
-        """Handle connection errors and log them."""
-        if not self.connection_error_logged:
-            logger.error("Error connecting to NFC reader:", error)
-            self.connection_error_logged = True
-        time.sleep(1)
-
-    def process_nfc_tag(self, connection):
-        """Process NFC tag if detected."""
-        try:
-            response, sw1, sw2 = connection.transmit(self.GET_UID)
-            if sw1 == 0x90 and sw2 == 0x00:
-                uid = toHexString(response)
-                if uid != self.current_tag_uid:
-                    self.current_tag_uid = uid
-                    print(f"Tag detected. UID: {uid}")
-                    tag_page = self.read_page(connection, 4)
-                    if tag_page:
-                        tag_page_str = ''.join(chr(b) for b in tag_page)
-                        if tag_page_str.startswith(self.TAG_PATTERN) and len(tag_page_str) == 4:
-                            print(f"Valid tag found! Tag page data: {tag_page_str}")
-                            full_data = self.read_full_tag_data(connection)
-                            print(f"Sending data to other app: {full_data}")
-                            self.process_tag_data(bytes(full_data))
-            else:
-                if self.current_tag_uid is not None:
-                    print(f"Tag removed. Last detected UID: {self.current_tag_uid}")
-                    self.send_to_other_app(b'{"status":"CardRemoved"}')
-                    self.current_tag_uid = None
-        except (SmartcardException, Exception) as e:
-            logger.error("Unexpected error during tag processing:", e)
-
-    def read_full_tag_data(self, connection):
-        """Read full data from multiple tag pages."""
-        full_data = []
-        for page in range(4, 15):
-            page_data = self.read_page(connection, page)
-            if page_data:
-                full_data.extend(page_data)
-        return full_data
-
-    def start(self):
-        """Start the NFC listener thread."""
-        if self.running:
-            logger.info("Listener already running.")
-            return
-        self.running = True
-        self.thread = threading.Thread(target=self.listen, daemon=True)
-        self.thread.start()
-        logger.info("Starting NFC Listening Thread.")
-        logger.info(f"Loaded DB Path: \033[32m{self.db_path}\033[0m")
-        logger.info(f"Transmitting Card Data on \033[1;34m{self.host}\033[0m:\033[1;32m{self.port}\033[0m")
-
-    def stop(self):
-        """Stop the NFC listener thread."""
-        self.running = False
-        if self.thread:
-            self.thread.join()
-            logger.info("Stopped NFC listening thread.")
+            logger.error(f"Error sending data: {e}")
 
 
 if __name__ == "__main__":
