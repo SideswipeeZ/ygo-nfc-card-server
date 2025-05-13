@@ -12,6 +12,7 @@ import base64
 from bs4 import BeautifulSoup, NavigableString
 from smartcard.System import readers
 from smartcard.util import toHexString
+from smartcard.Exceptions import NoCardException, SmartcardException, CardConnectionException
 import serial
 import serial.tools.list_ports
 from adafruit_pn532.uart import PN532_UART
@@ -212,9 +213,10 @@ class NFCReader:
     TAG_PATTERN = "YG"
     OTHER_APP_PORT = 41112
     OTHER_APP_HOST = 'localhost'
+    EXTERNAL_PORT = 41114
     GET_UID = [0xFF, 0xCA, 0x00, 0x00, 0x00]
 
-    def __init__(self, db_path: str, host: str = None, port: int = None, debug: bool = False):
+    def __init__(self, db_path: str, host: str = None, port: int = None, debug: bool = False, external_listen_port: int = None):
         """Initialize NFCReader with database path and optional connection settings."""
         self.db_path = db_path
         self.base_db_path = self._get_base_db_path(db_path)
@@ -223,6 +225,8 @@ class NFCReader:
         self.debug = debug
         self.host = host or self.OTHER_APP_HOST
         self.port = port or self.OTHER_APP_PORT
+        # New attribute for the external listener port
+        self.external_listen_port = external_listen_port or self.EXTERNAL_PORT
 
         # Reader state
         self.reader = None
@@ -240,7 +244,6 @@ class NFCReader:
         self.connection_error_logged = False
         self.scanning_for_pn532_printed = False
         self.no_pn532_msg_printed = False
-        self.pn532_sleep = 0.5
 
     @staticmethod
     def _get_base_db_path(db_path):
@@ -256,9 +259,10 @@ class NFCReader:
         self.running = True
         self._start_listener_threads()
 
-        logger.info("Started both NFC Listening Threads.")
+        logger.info("Started NFC Listening Threads.")
         logger.info(f"Loaded DB Path: {self.db_path}")
         logger.info(f"Transmitting Card Data on {self.host}:{self.port}")
+        logger.info(f"Listening for external commands on port {self.external_listen_port}")
 
     def stop(self):
         """Stop all NFC reader threads."""
@@ -268,7 +272,7 @@ class NFCReader:
         logger.info("Stopped all NFC listening threads.")
 
     def _start_listener_threads(self):
-        """Start the PN532 and pyscard listener threads."""
+        """Start the PN532, pyscard, and external command listener threads."""
         pn532_thread = threading.Thread(target=self._listen_pn532, daemon=True)
         self.threads.append(pn532_thread)
         pn532_thread.start()
@@ -277,9 +281,12 @@ class NFCReader:
         self.threads.append(pyscard_thread)
         pyscard_thread.start()
 
+        external_thread = threading.Thread(target=self._listen_for_external_command, daemon=True)
+        self.threads.append(external_thread)
+        external_thread.start()
+
     def _init_pn532(self):
         """Initialize the PN532 NFC reader if available."""
-        # Print scanning message only once per scan cycle
         if not self.scanning_for_pn532_printed:
             print("Scanning for PN532...")
             self.scanning_for_pn532_printed = True
@@ -298,18 +305,16 @@ class NFCReader:
                     self.pn532.SAM_configuration()
                     print("PN532 initialized. Waiting for an NFC card...")
 
-                    # Reset flags for next time
                     self.scanning_for_pn532_printed = False
                     self.no_pn532_msg_printed = False
                     return True
             except Exception:
                 continue
 
-        # No device found
         if not self.no_pn532_msg_printed:
             print(f"No PN532 detected. Retrying in 1 second...")
             self.no_pn532_msg_printed = True
-        time.sleep(self.pn532_sleep)
+        time.sleep(1)
         return False
 
     def _check_reader_connection(self):
@@ -325,28 +330,25 @@ class NFCReader:
             if not self.no_reader_logged:
                 logger.info("pyscard: No NFC reader detected. Waiting for device...")
                 self.no_reader_logged = True
-            time.sleep(self.pn532_sleep)
+            time.sleep(1)
             return False
 
     def _listen_pn532(self):
         """Thread function to listen for NFC tags using PN532."""
         while self.running:
-            # Initialize or reinitialize PN532 if needed
             if self.pn532 is None:
                 if not self._init_pn532():
                     continue
 
-            # Read tag if available
             try:
                 uid = self.pn532.read_passive_target(timeout=0.5)
             except Exception as e:
                 logger.error(f"PN532 read error: {e}")
                 logger.info("PN532 disconnected. Attempting reinitialization...")
                 self.pn532 = None
-                time.sleep(self.pn532_sleep)
+                time.sleep(1)
                 continue
 
-            # Handle tag data
             with self.uid_lock:
                 if uid is not None:
                     self.interface_status["pn532"] = True
@@ -365,12 +367,10 @@ class NFCReader:
     def _listen_pyscard(self):
         """Thread function to listen for NFC tags using pyscard."""
         while self.running:
-            # Check for reader connection
             if self.reader is None:
                 self._check_reader_connection()
                 continue
 
-            # Try to read UID from card
             try:
                 connection = self.reader.createConnection()
                 connection.connect()
@@ -380,7 +380,6 @@ class NFCReader:
                 response = None
                 success = False
 
-            # Handle card data
             with self.uid_lock:
                 if response is not None and success:
                     uid = toHexString(response)
@@ -399,9 +398,43 @@ class NFCReader:
             self._check_card_removal()
             time.sleep(0.1)
 
+    def _listen_for_external_command(self):
+        """
+        Thread function to listen for a string command from another Python app.
+        When a string is received, it is sent to _process_tag_data.
+        """
+        server_address = ('', self.external_listen_port)
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(server_address)
+            s.listen(5)
+            s.settimeout(1.0)
+            logger.info(f"External command listener started on port {self.external_listen_port}")
+
+            while self.running:
+                try:
+                    client_socket, addr = s.accept()
+                except socket.timeout:
+                    continue
+                except Exception as e:
+                    logger.error(f"Listener error: {e}")
+                    continue
+
+                with client_socket:
+                    try:
+                        data = client_socket.recv(1024)
+                        if data:
+                            logger.info(f"Received external command: {data.decode('utf-8', errors='ignore').strip()}")
+                            # Pass the received data to the processing method
+                            if data.startswith(b"RemovedTag"):
+                                self._send_to_other_app(b'{"status":"CardRemoved"}')
+                            else:
+                                self._process_tag_data(data)
+                    except Exception as e:
+                        logger.error(f"Error processing external command: {e}")
+
     def _read_ntag213_pages(self, start_page=4, end_page=14):
         """Read multiple pages from NTAG213 using PN532."""
-        # logger.info(f"PN532: Reading NTAG213 memory pages from {start_page} to {end_page}:")
+        print(f"PN532: Reading NTAG213 memory pages from {start_page} to {end_page}:")
         pages = []
 
         for page in range(start_page, end_page + 1):
@@ -492,7 +525,6 @@ class NFCReader:
         """Load and encode card image from file."""
         full_path = os.path.join(self.base_db_path, image_path)
 
-        # Fall back to default image if not found
         if not os.path.exists(full_path):
             if getattr(sys, 'frozen', False):
                 base_path = sys._MEIPASS
@@ -506,21 +538,18 @@ class NFCReader:
 
     def _extract_card_metadata(self, decoded_card):
         """Extract metadata from decoded card data."""
-        # Set string
         set_id = decoded_card.get("set_id", "")
         lang = decoded_card.get("lang", "")
         number = str(decoded_card.get("number", ""))
         set_str = f"{set_id}-{lang}{number}"
 
-        # Edition string
         edition = decoded_card.get("edition", "")
         edition_str = ""
         if edition:
             edition_json_path = os.path.join(self.base_db_path, "edition.json")
             with open(edition_json_path, "r") as edition_json_file:
                 edition_json = json.load(edition_json_file)
-            matched_key = next((key for key, value in edition_json.items()
-                                if value == edition), None)
+            matched_key = next((key for key, value in edition_json.items() if value == edition), None)
             if matched_key:
                 edition_str = matched_key
 
@@ -571,7 +600,7 @@ if __name__ == "__main__":
         print(f"Error: SQLite DB file not found at '{args.db}'")
         sys.exit(1)
 
-    version = "0.1.0"
+    version = "0.1.1"
     if not args.skip_banner:
         if getattr(sys, 'frozen', False):  # Checks if running as a PyInstaller executable
             base_path = sys._MEIPASS
